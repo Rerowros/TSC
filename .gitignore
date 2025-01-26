@@ -3,3 +3,5 @@ bot.session
 config.json
 bot.session-journal
 servers.json
+.idea
+откат.py
