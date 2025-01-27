@@ -1,4 +1,4 @@
-import asyncio
+import os
 import ipaddress
 import json
 import re
@@ -6,12 +6,13 @@ import time
 from pathlib import Path
 from typing import Dict, Any
 import paramiko
+import asyncio
 from telethon import TelegramClient, events, Button
 
 
 # ---------- Конфигурация ----------
 CONFIG_FILE = Path('config.json')
-with CONFIG_FILE.open('r') as config_file:
+with CONFIG_FILE.open('r', encoding="utf-8") as config_file:
     config = json.load(config_file)
 
 # ---------- Константы ----------
@@ -32,35 +33,56 @@ last_activity: Dict[int, float] = {}
 session_start_times: Dict[int, float] = {}
 
 # ---------- Операции с файлами ----------
-def load_servers() -> Dict[str, Any]:
-    """Load server data from JSON file, creating a new file if none exists."""
+# сохраняет данные серверов в JSON файл
+def save_servers():
+    global user_servers
+    with open(SERVERS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(user_servers, f, ensure_ascii=False, indent=4)
+
+# Загружает данные серверов из JSON файла
+def load_servers():
+    global user_servers
     try:
-        if not SERVERS_FILE.exists():
-            return save_servers({})
+        if os.path.exists(SERVERS_FILE):
+            if os.path.getsize(SERVERS_FILE) > 0:
+                with open(SERVERS_FILE, 'r', encoding='utf-8') as f:
+                    user_servers = json.load(f)
+                    return user_servers
+            else:
+                save_servers()
+        else:
+            save_servers()
+        return {}
+    except json.JSONDecodeError:
+        print("Ошибка чтения JSON файла. Создаю новый.")
+        save_servers()
+        return {}
+
+# Проверяет корректность введенных данных сервера
+def validate_server_input(server_string):
+    """Проверка формата ввода сервера"""
+    try:
+        name, ip, user, password = server_string.split(':')
+
+        # Проверка IP адреса
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return False, "Неверный формат IP адреса"
+
+        # Проверка символов в имени сервера
+        if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+            return False, "Имя сервера может содержать только буквы, цифры, - и _"
+
+        return True, None
+    except ValueError:
+        return False, "Неверный формат. Используйте: название:IP:пользователь:пароль"
+
+# разделяем длинные сообщения на несколько частей
+async def send_long_message(event, message):
+    for i in range(0, len(message), 4096):
+        await event.reply(message[i:i + 4096])
         
-        if SERVERS_FILE.stat().st_size == 0:
-            return save_servers({})
-            
-        with SERVERS_FILE.open('r', encoding='utf-8') as f:
-            return json.load(f)
-            
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"Ошибка чтения JSON файл. {e} Создаю новый")
-        return save_servers({})
-
-def save_servers(servers: Dict[str, Any]) -> Dict[str, Any]:
-    """Save server data to JSON file and return the saved data."""
-    try:
-        with SERVERS_FILE.open('w', encoding='utf-8') as f:
-            json.dump(servers, f, ensure_ascii=False, indent=4)
-        return servers
-    except OSError as e:
-        print(f"Ошибка сохранения сервера: {e}")
-        return servers
-
-# Initialize server data
-user_servers = load_servers()
-
 # ---------- Управление сессиями ----------
 def format_remaining_time(user_id: int) -> str:
     """Format remaining SSH session time for display."""
@@ -77,26 +99,6 @@ def format_remaining_time(user_id: int) -> str:
     seconds = int(remaining % 60)
     return f"Time remaining: {minutes}m {seconds}s"
 
-# Проверяет корректность введенных данных сервера
-def validate_server_input(server_string):
-    """Проверка формата ввода сервера"""
-    try:
-        name, ip, username, password = server_string.split(':')
-        
-        # Проверка IP
-        try:
-            ipaddress.ip_address(ip)
-        except ValueError:
-            return False, "Неверный формат IP адреса"
-
-        # Проверка символов в имени сервера
-        if not re.match(r'^[a-zA-Z0-9_-]+$', name):
-            return False, "Имя сервера может содержать только буквы, цифры, - и _"
-
-        return True, None
-    except ValueError:
-        return False, "Неверный формат. Используйте: название:IP:пользователь:пароль"
-
 # Периодически проверяет и закрывает неактивные SSH соединения
 async def maintain_ssh_connections():
     while True:
@@ -111,13 +113,15 @@ async def maintain_ssh_connections():
             if user_id in ssh_connections:
                 try:
                     ssh_connections[user_id].close()
-                except:
+                except Exception:
+                    print(f"Ошибка при закрытии соединения с {user_id}")
                     pass
                 del ssh_connections[user_id]
                 del last_activity[user_id]
                 console_mode[user_id] = False
                 
         await asyncio.sleep(60)  # Проверка
+
 
 # Создает или возвращает существующее SSH соединение для пользователя
 async def get_ssh_connection(user_id, server):
@@ -138,28 +142,6 @@ async def get_ssh_connection(user_id, server):
         return ssh
     except Exception as e:
         raise Exception(f"Ошибка подключения: {str(e)}")
-    
-# Добавить новую функцию для работы с TUI
-async def handle_tui_session(ssh, channel, event, user_id):
-    try:
-        transport = ssh.get_transport()
-        channel = transport.open_session()
-        channel.get_pty(term='xterm', width=80, height=24)
-        channel.invoke_shell()
-
-        while True:
-            if channel.recv_ready():
-                data = channel.recv(4096).decode(errors='replace')
-                # Здесь можно отправлять вывод пользователю
-                await event.respond(data)
-
-            if channel.exit_status_ready() or time.time() - last_activity[user_id] > SSH_TIMEOUT:
-                channel.close()
-                break
-
-            await asyncio.sleep(0.1)
-    except Exception as e:
-        return f"Ошибка TUI: {str(e)}"
 
 # Выполняет SSH команду через постоянное соединение
 async def execute_ssh_command(ip, username, password, command, user_id=None, event=None):    
@@ -168,12 +150,8 @@ async def execute_ssh_command(ip, username, password, command, user_id=None, eve
         ssh = await get_ssh_connection(user_id, server)
         last_activity[user_id] = time.time()
         
-        tui_commands = ['x-ui', 'htop', 'nano', 'vim']
-        if any(cmd in command for cmd in tui_commands) and event:
-            channel = ssh.get_transport().open_session()
-            return await handle_tui_session(ssh, channel, event, user_id)
-            
         stdin, stdout, stderr = ssh.exec_command(command)
+        stdin.close() # закрываем для явного завершения ввода
         output = stdout.read().decode()
         error = stderr.read().decode()
         
@@ -222,7 +200,6 @@ async def start_handler(event):
     else:
         await event.reply('Добавьте сервер в формате:\nназвание:IP:пользователь:пароль')
 
-# Обработчик текстовых сообщений
 @bot.on(events.NewMessage)
 async def message_handler(event):
     global console_mode
@@ -250,6 +227,12 @@ async def message_handler(event):
             
         if user_id in user_servers:
             server = user_servers[user_id]
+            
+            # Проверяем, существует ли активная сессия
+            if int(user_id) not in last_activity:
+                last_activity[int(user_id)] = time.time()
+                session_start_times[int(user_id)] = time.time()
+            
             result = await execute_ssh_command(
                 server['ip'],
                 server['username'],
@@ -257,14 +240,21 @@ async def message_handler(event):
                 event.raw_text,
                 user_id
             )
-            remaining_time = format_remaining_time(user_id)
+            remaining_time = format_remaining_time(int(user_id))
             buttons = [
-                [Button.inline('❌ Выход', 'exit_console')]
+                [Button.inline('❌ Выход', 'exit_console')],
+                [Button.inline('🔄Продлить сессию', 'console_time_add')]
             ]
-            await event.reply(f'```\n{result}\n```\n{remaining_time}', buttons=buttons)
+            # Добавляем проверку длины сообщения
+            formatted_result = f'```\n{result}\n```\n{remaining_time}'
+            if len(formatted_result) > 4096:
+                await send_long_message(event, formatted_result)
+                # Отправляем кнопки отдельным сообщением
+                await event.reply('Управление консолью:', buttons=buttons)
+            else:
+                await event.reply(formatted_result, buttons=buttons)
             return
 
-        
     # добавление сервера    
     if ':' in event.raw_text:
         is_valid, error_message = validate_server_input(event.raw_text)
@@ -303,7 +293,7 @@ async def message_handler(event):
                 await event.reply(f'❌ Ошибка подключения к серверу: {str(e)}')
 
         except Exception as e:
-            await event.reply('❌ Ошибка при добавлении сервера')
+            await event.reply(f'❌ Ошибка при добавлении сервера {e}')
     else:
         if user_id in user_servers:
             await show_main_menu(event)
@@ -344,15 +334,7 @@ async def callback_handler(event):
         server_name = data.split(':')[1]
         await show_server_menu(event, server_name)
         return
-
-    if data.startswith('tui_input:'):
-        input_value = data.split(':')[1]
-        server = user_servers[user_id]
-        ssh = ssh_connections[user_id]
-        channel = ssh.get_transport().open_session()
-        channel.send(f"{input_value}\n")
-        return
-    
+        
     if data.startswith(('console:', 'stats:', 'reboot:', 'files:', 'security:')):
         action = data.split(':')[0]
         messages = {
@@ -365,7 +347,7 @@ async def callback_handler(event):
         await event.answer(messages[action])
 
 if __name__ == '__main__':
-    print('Бот запущен')
+    print('Bot started time:', time.asctime())
     
     # Создаем и получаем event loop
     loop = asyncio.get_event_loop()
